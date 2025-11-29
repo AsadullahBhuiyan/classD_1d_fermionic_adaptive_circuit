@@ -1,7 +1,9 @@
 import numpy as np
 import os
 import time
+import sys
 from tqdm import tqdm
+from tqdm import notebook as tqdm_nb
 from joblib import Parallel, delayed, parallel_backend
 from threadpoolctl import threadpool_limits
 import joblib
@@ -39,8 +41,8 @@ class classD_1d_MFGTN:
         DW=True,
         nshell=None,
         G0=None,
-        mu_triv=3,
-        mu_top=1,
+        mu_1=3,
+        mu_2=1,
     ):
         '''Initialize lattice dimensions, domain-wall option, and starting covariance.'''
         self.time_init = time.time()
@@ -49,12 +51,12 @@ class classD_1d_MFGTN:
         self.Ntot_dofs = 4 * int(N)
         self.nshell = nshell
         self.DW = bool(DW)
-        self.mu_triv = mu_triv
-        self.mu_top = mu_top
+        self.mu_1 = mu_1
+        self.mu_2 = mu_2
         
         # Initialize Domain Wall profile
         if self.DW:
-            self.create_domain_wall(mu_triv=self.mu_triv, mu_top=self.mu_top)
+            self.create_domain_wall(mu_1=self.mu_1, mu_2=self.mu_2)
 
         self.G0 = None if G0 is None else np.array(G0, dtype=np.complex128, copy=True)
         self.G = None
@@ -107,7 +109,8 @@ class classD_1d_MFGTN:
 
     def _joblib_tqdm_ctx(self, total, desc):
         """Single outer tqdm bar for joblib.Parallel."""
-        return tqdm_joblib(tqdm(total=total, desc=desc, unit="task")) if total and total > 1 else nullcontext()
+        bar = (tqdm_nb.tqdm if not sys.stdout.isatty() else tqdm)
+        return tqdm_joblib(bar(total=total, desc=desc, unit="task")) if total and total > 1 else nullcontext()
     
     def _ensure_outdir(self, path):
         os.makedirs(path, exist_ok=True)
@@ -120,29 +123,57 @@ class classD_1d_MFGTN:
         Z2 = np.zeros((m, n), dtype=B.dtype)
         return np.block([[A, Z1], [Z2, B]])
 
+    def solve_reg(self, K, B, eps=1e-9):
+        """
+        Solve K X = B with a small Tikhonov ridge if needed; fall back to pinv.
+        """
+        try:
+            return np.linalg.solve(K, B)
+        except np.linalg.LinAlgError:
+            pass
+        n = K.shape[0]
+        K_reg = K + eps * np.eye(n, dtype=K.dtype)
+        try:
+            return np.linalg.solve(K_reg, B)
+        except np.linalg.LinAlgError:
+            return np.linalg.pinv(K_reg) @ B
+
     def get_top_layer(self, G):
         """Return the top-layer block of a full covariance."""
         G = np.asarray(G)
-        N = G.shape[0] // 2
-        return G[:2 * N, :2 * N]
+        expect = 2 * self.Nx
+        if G.shape[0] == expect:
+            return G
+        if G.shape[0] >= 2 * expect:
+            return G[:expect, :expect]
+        raise ValueError(f"Covariance too small for top layer: got {G.shape}, expected at least {(2*expect, 2*expect)}")
 
     def get_bottom_layer(self, G):
         """Return the bottom-layer block of a full covariance."""
         G = np.asarray(G)
-        N = G.shape[0] // 2
-        return G[2 * N:, 2 * N:]
+        expect = 2 * self.Nx
+        if G.shape[0] < 2 * expect:
+            raise ValueError(f"Covariance too small for bottom layer: got {G.shape}")
+        return G[expect:, expect:]
+    
+    def _stabilize_covariance(self, G, clip_val=1.0):
+        """Enforce antisymmetry and optionally clip entries to [-clip_val, clip_val]."""
+        G = 0.5 * (G - G.T)
+        if clip_val is not None:
+            G = np.clip(np.real(G), -clip_val, clip_val) 
+        return G
 
     # ------------------ Majorana Wannier (MW) Projectors ------------------
 
-    def create_domain_wall(self, mu_triv, mu_top):
+    def create_domain_wall(self, mu_1, mu_2):
         '''Construct and store the default domain-wall mass profile.'''
         N = self.Nx
-        mu_profile = np.full(N, float(mu_triv))
+        mu_profile = np.full(N, float(mu_1))
         half = N // 2
         w = max(1, int(np.floor(0.2 * N)))
         x0 = max(0, half - w)
         x1 = min(N, half + w + 1)
-        mu_profile[x0:x1] = float(mu_top)
+        mu_profile[x0:x1] = float(mu_2)
         self.DW_loc = [int(x0-1), int(x1-1)]
         self.mu_profile = mu_profile
 
@@ -155,7 +186,7 @@ class classD_1d_MFGTN:
         if self.DW:
             mu_vec = self.mu_profile
         else:
-            mu_vec = np.full(N, self.mu_triv, float)
+            mu_vec = np.full(N, self.mu_1, float)
 
         k = 2 * np.pi * np.fft.fftfreq(N, d=1.0)              
         Rgrid = np.arange(N, dtype=float)                     
@@ -193,17 +224,13 @@ class classD_1d_MFGTN:
         Pi = np.real_if_close(Pi)
 
         # Ensure shapes are (2N, N) for the Top layer logic
-        # Top block = Real Part, Bottom block = 0
-        self.MW1 = np.vstack((
-            Pi[:, :, 0].astype(np.float64, copy=True), 
-            np.zeros((N, N))
-        )) #(2N, R)
-        
-        # Top block = 0, Bottom block = Imag Part
-        self.MW2 = np.vstack((
-            np.zeros((N, N)), 
-            Pi[:, :, 1].astype(np.float64, copy=True)
-        )) # (2N, R)
+        # Top block = component 0, Bottom block = 0
+        self.MW1 = np.vstack((Pi[:, :, 0].astype(np.float64, copy=True),
+                              np.zeros_like(Pi[:, :, 0], dtype=np.float64)))  # (2N, R)
+        # Top block = 0, Bottom block = component 1
+        self.MW2 = np.vstack((np.zeros_like(Pi[:, :, 1], dtype=np.float64),
+                              Pi[:, :, 1].astype(np.float64, copy=True)))      # (2N, R)
+  
 
     # ------------------------------ Real-space Kitaev H and covariance ------------------------------
 
@@ -216,13 +243,13 @@ class classD_1d_MFGTN:
         mu = float(mu)
         if DW:
             if not hasattr(self, "mu_profile"):
-                self.create_domain_wall(mu_triv=self.mu_triv, mu_top=self.mu_top)
+                self.create_domain_wall(mu_1=self.mu_1, mu_2=self.mu_2)
             mu_diag = np.diag(self.mu_profile.astype(np.complex128))
-            M = -mu_diag + 2 * np.eye(N, k=1, dtype=np.complex128)
+            M = -mu_diag - 2 * np.eye(N, k=-1, dtype=np.complex128)
         else:
-            M = -mu * np.eye(N, dtype=np.complex128) + 2 * np.eye(N, k=1, dtype=np.complex128)
+            M = -mu * np.eye(N, dtype=np.complex128) - 2 * np.eye(N, k=-1, dtype=np.complex128)
         if PBCs:
-            M[-1, 0] = 2
+            M[0, -1] = -2
         zero_block = np.zeros_like(M)
         H = 0.5j * np.block([[zero_block, M], [-M.T, zero_block]])
         return H
@@ -237,86 +264,103 @@ class classD_1d_MFGTN:
         G = 1j * eigvecs @ sign_D @ eigvecs.conj().T
         return G
 
-    # --------------------------- Fast O(N^2) Measurement Updates ---------------------------
+    # --------------------------- Measurement Updates (block method) ---------------------------
 
-    def _rank2_update_solver(self, G, u, v, outcome):
+    def measure_top_layer(self, G, Pi_1, Pi_2, pos_parity=True, Asymm=True):
         """
-        Efficient Rank-2 update for measuring P = i * gamma_u * gamma_v with outcome lambda.
-        Formula based on Bravyi (2005) Lagrangian representation, Eq. 33.
-        (Sherman-Morrison Formula)
-        
-        Complexity: O(N^2)
+        Parity measurement on the top (physical) layer using block inversion.
+        Pi_1, Pi_2 are (2N,) vectors in the top layer subspace.
         """
-        # Calculate columns of G (Matrix-Vector product: O(N^2) if u dense, O(N) if u sparse)
-        Gu = G @ u
-        Gv = G @ v
-        
-        # Calculate overlap (Scalar)
-        # Note: For Majorana covariance, G is skew-symmetric. 
-        # Expectation value <P> = i * u.T @ G @ v
-        # Let omega = u.T @ G @ v
-        omega = np.dot(u, Gv)
-        
-        # Stability check: If already in eigenstate (omega ~ outcome), no update needed
-        if abs(outcome - omega) < 1e-9:
-            return G
-            
-        # Denominator 1 - omega^2 (Singular if state is pure and <P> = +/-1)
-        denom = 1.0 - omega**2
-        
-        # If denom is too small, use pseudo-inverse or skip (already projected)
-        if abs(denom) < 1e-12:
-            return G
+        N = self.Nx
+        G = np.asarray(G, dtype=np.complex128)
+        Pi_1 = np.asarray(Pi_1, dtype=np.complex128).reshape(-1, 1)
+        Pi_2 = np.asarray(Pi_2, dtype=np.complex128).reshape(-1, 1)
 
-        inv_denom = 1.0 / denom
-        
-        # Coefficients for the update
-        # G' = G + c1(Gu Gv^T - Gv Gu^T) + c2(Gu Gu^T + Gv Gv^T)
-        # outcome is lambda (+1 or -1)
-        c1 = (outcome - omega) * inv_denom
-        c2 = (outcome * omega - 1.0) * inv_denom
-        
-        # Construct update terms (Outer products: O(N^2))
-        # Term 1: Antisymmetric part
-        T1 = np.outer(Gu, Gv)
-        T1 -= T1.T  # Gu Gv^T - Gv Gu^T
-        
-        # Term 2: Symmetric part
-        T2 = np.outer(Gu, Gu) + np.outer(Gv, Gv)
-        
-        # Update G
-        G_new = G + c1 * T1 + c2 * T2
-        
-        return G_new
+        Id = np.eye(2*N, dtype=np.complex128)
+        H = Pi_1 @ Pi_2.T - Pi_2 @ Pi_1.T
+        P = Pi_1 @ Pi_1.T + Pi_2 @ Pi_2.T
 
-    def measure_parity(self, G, u, v, pos_parity=True):
-        '''Unified measurement wrapper. Updates G given vectors u, v and desired parity.'''
-        outcome = 1.0 if pos_parity else -1.0
-        return self._rank2_update_solver(G, u, v, outcome)
+        Gtt = self.get_top_layer(G)
+        Gbb = self.get_bottom_layer(G)
+        Gbt = G[2*N:, :2*N]
+
+        if pos_parity:
+            Psi_11, Psi_12, Psi_22 = -H, (Id - P), H
+        else:
+            Psi_11, Psi_12, Psi_22 = H, (Id - P), -H
+
+        A = self.block_diag(Psi_22, Gbb)
+        K = self.block_diag(Psi_12, Gbt)
+        M = np.block([[Psi_11, Id], [-Id, Gtt]])
+        B = self.solve_reg(M, K.T)
+
+        Gprime = A + K @ B
+        if Asymm:
+            Gprime = 0.5 * (Gprime - Gprime.T)
+        return Gprime
+
+    def measure_bottom_layer(self, G, Pi_1, Pi_2, pos_parity=True, Asymm=True):
+        """
+        Parity measurement on the bottom (ancilla) layer using block inversion.
+        Pi_1, Pi_2 are (2N,) vectors in the bottom layer subspace.
+        """
+        N = self.Nx
+        G = np.asarray(G, dtype=np.complex128)
+        Pi_1 = np.asarray(Pi_1, dtype=np.complex128).reshape(-1, 1)
+        Pi_2 = np.asarray(Pi_2, dtype=np.complex128).reshape(-1, 1)
+
+        Id = np.eye(2 * N, dtype=np.complex128)
+        H = Pi_1 @ Pi_2.T - Pi_2 @ Pi_1.T
+        P = Pi_1 @ Pi_1.T + Pi_2 @ Pi_2.T
+
+        Gtt = self.get_top_layer(G)
+        Gbb = self.get_bottom_layer(G)
+        Gtb = G[:2*N, 2*N:]
+
+        if pos_parity:
+            Psi_11, Psi_21, Psi_22 = -H, -(Id - P), H
+        else:
+            Psi_11, Psi_21, Psi_22 = H, -(Id - P), -H
+
+        A = self.block_diag(Gtt, Psi_22)
+        K = self.block_diag(Gtb, Psi_21)
+        M = np.block([[Gbb, Id], [-Id, Psi_11]])
+        B = self.solve_reg(M, K.T)
+
+        Gprime = A + K @ B
+        if Asymm:
+            Gprime = 0.5 * (Gprime - Gprime.T)
+        return Gprime
 
     # --------------------------- fSWAP & Operations ---------------------------
 
     def fSWAP(self, Pi_1_top, Pi_2_top, Pi_1_bot, Pi_2_bot):
-        '''Construct the fSWAP unitary. Use concatenate to ensure 1D inputs.
-            Furthermore, we will assume that the inputs are size (4N, )
-        '''
-        # Ensure inputs are 1D
-        Pi_1t = np.asarray(Pi_1_top, dtype=np.complex128)
-        Pi_2t = np.asarray(Pi_2_top, dtype=np.complex128)
-        Pi_1b = np.asarray(Pi_1_bot, dtype=np.complex128)
-        Pi_2b = np.asarray(Pi_2_bot, dtype=np.complex128)        
+        """
+        Construct the fSWAP orthogonal matrix swapping a top pair with a bottom pair.
+        Inputs are (2N,) in their respective layers; we pad to (4N,) internally.
+        """
+        Pi_1_top = np.asarray(Pi_1_top, dtype=np.complex128).reshape(-1)
+        Pi_2_top = np.asarray(Pi_2_top, dtype=np.complex128).reshape(-1)
+        Pi_1_bot = np.asarray(Pi_1_bot, dtype=np.complex128).reshape(-1)
+        Pi_2_bot = np.asarray(Pi_2_bot, dtype=np.complex128).reshape(-1)
 
+        N = self.Nx
+        zeros = np.zeros(2 * N, dtype=np.complex128)
 
-        # Projector P
+        # pad to full (4N,)
+        Pi_1t = np.concatenate([Pi_1_top, zeros])
+        Pi_2t = np.concatenate([Pi_2_top, zeros])
+        Pi_1b = np.concatenate([zeros, Pi_1_bot])
+        Pi_2b = np.concatenate([zeros, Pi_2_bot])
+
         Pt = np.outer(Pi_1t, Pi_1t.conj()) + np.outer(Pi_2t, Pi_2t.conj())
         Pb = np.outer(Pi_1b, Pi_1b.conj()) + np.outer(Pi_2b, Pi_2b.conj())
         P = Pt + Pb
 
-        # Swap generator X = H - H.T
         Htb = np.outer(Pi_1t, Pi_1b.conj()) + np.outer(Pi_2t, Pi_2b.conj())
         X = Htb - Htb.T
-        
-        Id = np.eye(P.shape[0], dtype=np.complex128)
+
+        Id = np.eye(4 * N, dtype=np.complex128)
         O = Id - P - X
         return O
 
@@ -325,31 +369,23 @@ class classD_1d_MFGTN:
         G = np.asarray(G, dtype=np.complex128)
         N = self.Nx
 
-        # 1. PADDING: Construct Full 4N vectors for Top Layer Wannier modes
-        # self.MW1/2 are (2N, N). We extract column R (size 2N).
-        # We append 2N zeros for the bottom layer.
-        Pi_1 = np.concatenate((self.MW1[:, R], np.zeros(2*N))) # (4N,)
-        Pi_2 = np.concatenate((self.MW2[:, R], np.zeros(2*N))) # (4N,)
+        Pi_1 = np.array(self.MW1[:, R], dtype=np.complex128, copy=True)  # (2N,)
+        Pi_2 = np.array(self.MW2[:, R], dtype=np.complex128, copy=True)  # (2N,)
 
-        # 2. PADDING: Construct Full 4N vectors for Ancilla modes at R
-        # Indices: [Top(2N) | Bot(2N)] -> Bot is range [2N, 4N]
-        e1 = np.zeros(4*N, dtype=np.complex128)
-        e2 = np.zeros(4*N, dtype=np.complex128)
-        e1[2*N + R] = 1.0       # Bottom layer, species 1
-        e2[2*N + N + R] = 1.0   # Bottom layer, species 2
+        # local majorana modes
+        e1 = np.zeros(2*N, dtype=np.complex128)
+        e2 = np.zeros(2*N, dtype=np.complex128)
+        e1[R] = 1.0       # Bottom layer, species 1
+        e2[N + R] = 1.0   # Bottom layer, species 2
 
-        # Fast Born Probability: p = (1 + <i g1 g2>) / 2 = (1 + u^T G v) / 2
-        expectation = np.dot(Pi_1, G @ Pi_2) # O(N^2)
-        p_pos = 0.5 * (1.0 + np.real(expectation))
+        Gtt = self.get_top_layer(G)
+        expectation = np.real(np.dot(Pi_1, Gtt @ Pi_2))
+        p_pos = 0.5 * (1.0 + expectation)
         p_pos = np.clip(p_pos, 0.0, 1.0)
 
-        # Sample and Update
-        if np.random.rand() < p_pos:
-            G = self.measure_parity(G, Pi_1, Pi_2, pos_parity=True)
-        else:
-            G = self.measure_parity(G, Pi_1, Pi_2, pos_parity=False)
-            
-            # Apply fSWAP correction
+        outcome_pos = True if (p_pos >= 1.0 or np.random.rand() < p_pos) else False
+        G = self.measure_top_layer(G, Pi_1, Pi_2, pos_parity=outcome_pos)
+        if not outcome_pos:
             O = self.fSWAP(Pi_1, Pi_2, e1, e2)
             G = O.T @ G @ O
 
@@ -359,32 +395,33 @@ class classD_1d_MFGTN:
         '''Measure every bottom-layer mode once using fast updates.'''
         G = np.asarray(G, dtype=np.complex128)
         N = self.Nx
+        Gbb = self.get_bottom_layer(G)
 
         for R in range(N):
-            # PADDING: Construct vectors in 4N space for bottom layer
-            u = np.zeros(4*N, dtype=np.complex128)
-            v = np.zeros(4*N, dtype=np.complex128)
-            u[2*N + R] = 1.0
-            v[2*N + N + R] = 1.0
+            e1 = np.zeros(2*N, dtype=np.complex128)
+            e2 = np.zeros(2*N, dtype=np.complex128)
+            e1[R] = 1.0
+            e2[N + R] = 1.0
             
             # Fast Probability extraction (G[u_idx, v_idx] for sparse vectors)
-            expectation = G[2*N + R, 3*N + R] 
-            p_pos = 0.5 * (1.0 + np.real(expectation))
+            expectation = float(np.real(Gbb[R, N + R]))
+            p_pos = 0.5 * (1.0 + expectation)
             p_pos = np.clip(p_pos, 0.0, 1.0)
-            
-            outcome_pos = (np.random.rand() < p_pos)
-            G = self.measure_parity(G, u, v, pos_parity=outcome_pos)
+
+            outcome_pos = True if (p_pos >= 1.0 or np.random.rand() < p_pos) else False
+            # pass bottom-layer components (2N-length) to the update
+            G = self.measure_bottom_layer(G, e1.copy(), e2.copy(), pos_parity=outcome_pos)
 
         return G
 
     def post_selection_top_layer(self, G, R):
         '''Project top layer at R onto positive parity.'''
         N = self.Nx
-        # PADDING: Ensure full 4N vectors
-        Pi_1 = np.concatenate((self.MW1[:, R], np.zeros(2*N)))
-        Pi_2 = np.concatenate((self.MW2[:, R], np.zeros(2*N)))
+        Pi_1 = self.MW1[:, R]
+        Pi_2 = self.MW2[:, R]
         
-        G = self.measure_parity(G, Pi_1, Pi_2, pos_parity=True)
+        # top-layer projection only
+        G = self.measure_top_layer(G, Pi_1, Pi_2, pos_parity=True)
         return G
 
     def randomize_bottom_layer(self, G):
@@ -414,6 +451,7 @@ class classD_1d_MFGTN:
         remember_init=True,
         save=True,
         save_suffix=None,
+        project_per_cycle=False,
     ):
         """Execute the adaptive circuit."""
         N = self.Nx
@@ -424,10 +462,15 @@ class classD_1d_MFGTN:
         if not hasattr(self, "MW1") or not hasattr(self, "MW2"):
             self.construct_MW_projectors(nshell=self.nshell)
 
-        def _cache_key(*, N, cycles, samples, nshell, DW, init_mode, store_mode, mu_triv, mu_top):
+        def _cache_key(*, N, cycles, samples, nshell, DW, init_mode, store_mode, mu_1, mu_2):
             nsh = "None" if nshell is None else str(nshell)
-            return (f"N{int(N)}_C{int(cycles)}_S{int(samples)}_nsh{nsh}"
-                    f"_DW{int(bool(DW))}_mutriv{mu_triv}_mutop{mu_top}"
+            if self.DW:
+                return (f"N{int(N)}_C{int(cycles)}_S{int(samples)}_nsh={nsh}"
+                    f"_DW{int(bool(DW))}_mu1={mu_1}_mu2={mu_2}"
+                    f"_init-{init_mode}_store-{store_mode}")
+            else:
+                return (f"N{int(N)}_C{int(cycles)}_S{int(samples)}_nsh={nsh}"
+                    f"_DW{int(bool(DW))}_mu1={mu_1}"
                     f"_init-{init_mode}_store-{store_mode}")
 
         def _save_histories(array, samples_count):
@@ -435,7 +478,7 @@ class classD_1d_MFGTN:
             outdir = self._ensure_outdir("cache/G_history_samples")
             key = _cache_key(N=self.Nx, cycles=cycles, samples=samples_count,
                             nshell=self.nshell, DW=self.DW, init_mode=init_mode, store_mode=store,
-                            mu_triv=self.mu_triv, mu_top=self.mu_top)
+                            mu_1=self.mu_1, mu_2=self.mu_2)
             filename = f"{key}.npz"
             if save_suffix:
                 root, ext = os.path.splitext(filename)
@@ -461,8 +504,10 @@ class classD_1d_MFGTN:
                 if remember_init: self.G_list.append(self.G.copy())
 
             total_sites = cycles * N
-            pbar = tqdm(total=total_sites, desc="Adaptive (sites)", unit="site", leave=True) if progress else None
+            bar = (tqdm_nb.tqdm if not sys.stdout.isatty() else tqdm)
+            pbar = bar(total=total_sites, desc="Running adaptive circuit (sites):", unit="site", leave=True) if progress else None
 
+            t_start = time.time()
             for _c in range(cycles):
                 for R in range(N):
                     self.G = (self.top_layer_meas_feedback(self.G, R)
@@ -472,10 +517,20 @@ class classD_1d_MFGTN:
                 if not postselect:
                     self.G = self.randomize_bottom_layer(self.G)
                     self.G = self.measure_all_bottom_modes(self.G)
+                if project_per_cycle:
+                    K = 1j * self.G
+                    eigvals, eigvecs = np.linalg.eigh(K)
+                    eigvals_clipped = np.sign(eigvals)
+                    eigvals_clipped[eigvals_clipped == 0] = 1.0
+                    K_proj = eigvecs @ np.diag(eigvals_clipped) @ eigvecs.conj().T
+                    self.G = -1j * K_proj
                 if G_history:
                     self.G_list.append(self.G.copy())
 
             if pbar is not None: pbar.close()
+            if progress:
+                elapsed = time.time() - t_start
+                print(f"Total elapsed: {elapsed:.2f} s", flush=True)
 
             if store == "none": return None
             Nlayer = 2 * N
@@ -512,9 +567,10 @@ class classD_1d_MFGTN:
                     remember_init=remember_init, save=False
                 )
                 full_hist = [np.asarray(Gk) for Gk in child.G_list]
-                if store == "full": return np.stack(full_hist, axis=0)
+                if store == "full":
+                    return np.stack(full_hist, axis=0)
                 elif store == "top":
-                    top_hist = [Gk[:Nlayer, :Nlayer] for Gk in full_hist]
+                    top_hist = [self.get_top_layer(Gk) for Gk in full_hist]
                     return np.stack(top_hist, axis=0)
         
         with self._joblib_tqdm_ctx(S, "samples"):
@@ -549,8 +605,8 @@ class classD_1d_MFGTN:
         child.Ntot_dofs = self.Ntot_dofs
         child.nshell = self.nshell
         child.DW = self.DW
-        child.mu_triv = self.mu_triv
-        child.mu_top = self.mu_top
+        child.mu_1 = self.mu_1
+        child.mu_2 = self.mu_2
         child.time_init = self.time_init
         child.DW_loc = getattr(self, "DW_loc", None)
         child.mu_profile = getattr(self, "mu_profile", None)
@@ -562,3 +618,77 @@ class classD_1d_MFGTN:
         child.G_list = []
         child.G_history_samples = None
         return child
+
+# --------------------------- Entanglement & Mutual Info ---------------------------
+
+    def _von_neumann_entropy(self, G_sub):
+        """
+        Compute Von Neumann entropy S = -Tr(rho ln rho) for a subsystem 
+        defined by the Majorana covariance matrix G_sub.
+        """
+        # 1. Construct Hermitian matrix K = i * G_sub
+        # G_sub is real antisymmetric, so K is Hermitian.
+        K = 1j * np.asarray(G_sub)
+        
+        # 2. Diagonalize to find eigenvalues nu
+        # Eigenvalues come in pairs +/- nu_k. We only need the positive ones.
+        evals = np.linalg.eigvalsh(K)
+        
+        # 3. Positive modes (take magnitude to guard numerical sign noise)
+        n_modes = evals.shape[0] // 2
+        nus = np.abs(evals[-n_modes:])
+        nus = np.clip(nus, 0.0, 1.0)
+        
+        # 4. Binary Entropy Formula
+        # S = - sum_k [ p_k ln p_k + (1-p_k) ln (1-p_k) ]
+        # where p_k = (1 + nu_k) / 2
+        p = 0.5 * (1.0 + nus)
+        
+        # Safe log function (0*log(0) = 0)
+        def safe_entr(x):
+            return -x * np.log(x + 1e-15)
+            
+        entropies = safe_entr(p) + safe_entr(1.0 - p)
+        return np.sum(entropies)
+
+    def compute_antipodal_MI(self, G):
+        """
+        Compute Mutual Information I(A:B) between two antipodal regions 
+        of size N/4 on the physical (top) layer.
+        
+        Region A: Sites [0, ..., N/4 - 1]
+        Region B: Sites [N/2, ..., N/2 + N/4 - 1]
+        """
+        N = self.Nx
+        L_sub = N // 4
+        
+        # 1. Isolate Physical (Top) Layer
+        # Your basis is [gamma^1_0...gamma^1_{N-1}, gamma^2_0...gamma^2_{N-1}]
+        if G.shape[0] == 2 * N:
+            G_top = np.asarray(G, dtype=np.complex128)
+        else:
+            G_top = self.get_top_layer(G) # Shape (2N, 2N)
+        
+        # 2. Define Lattice Site Indices
+        sites_A = np.arange(0, L_sub)
+        sites_B = np.arange(N // 2, N // 2 + L_sub)
+        
+        # 3. Convert Site Indices to Majorana Indices
+        # For site i, indices are i (species 1) and N+i (species 2)
+        indices_A = np.concatenate([sites_A, sites_A + N])
+        indices_B = np.concatenate([sites_B, sites_B + N])
+        indices_AB = np.concatenate([indices_A, indices_B])
+        
+        # 4. Extract Sub-matrices using np.ix_
+        G_A = G_top[np.ix_(indices_A, indices_A)]
+        G_B = G_top[np.ix_(indices_B, indices_B)]
+        G_AB = G_top[np.ix_(indices_AB, indices_AB)]
+        
+        # 5. Compute Entropies
+        S_A = self._von_neumann_entropy(G_A)
+        S_B = self._von_neumann_entropy(G_B)
+        S_AB = self._von_neumann_entropy(G_AB)
+        
+        # 6. Mutual Information
+        # I(A:B) = S(A) + S(B) - S(AB)
+        return S_A + S_B - S_AB
