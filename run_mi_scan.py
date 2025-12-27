@@ -71,7 +71,7 @@ def run_config(mu_val, N, nshell, samples=100, cycles=20, n_jobs=None):
 def main():
     t0 = time.time()
     mu_list = np.unique(np.concatenate((np.linspace(1.0, 1.8, 21), np.linspace(1.8, 2.2 , 51), np.linspace(2.2, 3.0, 21))))
-    N_list = [32, 64, 128]
+    N_list = [16, 32, 64]
     nshell_list = [1, 2, 3, None]
     samples = 100
     cycles = 20
@@ -92,7 +92,7 @@ def main():
 
     # Save raw data
     os.makedirs("results", exist_ok=True)
-    data_path = os.path.join("results", "mi_scan_finer_near_mu=2_bigger_system_size.npz")
+    data_path = os.path.join("results", "mi_scan_finer_near_mu=2.npz")
     np.savez_compressed(
         data_path,
         mu_list=mu_list,
